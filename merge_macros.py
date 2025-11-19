@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""merge_macros.py - OSRS Anti-Detection with Camera & Misclick Simulation"""
+"""merge_macros.py - OSRS Anti-Detection with AFK & Zone Awareness"""
 
 from pathlib import Path
-import argparse, json, random, re, sys, os, math
+import argparse, json, random, re, sys, os, math, shutil
 from copy import deepcopy
 from zipfile import ZipFile
 from itertools import combinations, permutations
@@ -10,13 +10,6 @@ from itertools import combinations, permutations
 COUNTER_PATH = Path(".github/merge_bundle_counter.txt")
 SPECIAL_FILENAME = "close reopen mobile screensharelink.json"
 SPECIAL_KEYWORD = "screensharelink"
-
-# Enable debug logging
-DEBUG_CLICKS = os.environ.get("DEBUG_CLICKS", "0") == "1"
-
-def debug_log(msg):
-    if DEBUG_CLICKS:
-        print(f"[DEBUG] {msg}", file=sys.stderr)
 
 def parse_time_to_seconds(s: str) -> int:
     if s is None or not str(s).strip():
@@ -112,7 +105,7 @@ def find_json_files_in_dir(dirpath: Path):
         return []
 
 def load_json_events(path: Path):
-    """CRITICAL: Load events WITHOUT any modifications. Preserves ALL original fields."""
+    """CRITICAL: Load events WITHOUT any modifications."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
@@ -164,7 +157,7 @@ def zero_base_events(events):
     return shifted, duration_ms
 
 def preserve_click_integrity(events):
-    """CRITICAL FIX: Mark click events as protected but return ALL events."""
+    """Mark click events as protected but return ALL events."""
     preserved = []
     for i, e in enumerate(events):
         new_e = deepcopy(e)
@@ -179,7 +172,7 @@ def preserve_click_integrity(events):
     return preserved
 
 def is_protected_event(event):
-    """Check if event is marked as protected (click down/up)"""
+    """Check if event is marked as protected"""
     return event.get('PROTECTED', False)
 
 def compute_minutes_from_ms(ms: int):
@@ -196,156 +189,176 @@ def number_to_letters(n: int) -> str:
     return letters
 
 def part_from_filename(path: str) -> str:
-    """Extract filename stem for labeling"""
+    """Extract filename stem"""
     try:
         return Path(str(path)).stem
     except:
         return str(path)
 
-def add_camera_movements_in_pauses(events, rng, is_desktop=True):
-    """NEW: Adds realistic camera movements during long pauses only."""
-    if not is_desktop:
+def add_desktop_mouse_paths(events, rng):
+    """
+    ULTRA-SAFE VERSION: Only adds mouse paths in long click-free periods.
+    
+    NEW RULES:
+    - Only operates in periods with NO clicks for 2+ minutes (120,000ms)
+    - Must have 2 minutes before AND 2 minutes after the path insertion point
+    - Never inserts near any MouseDown/MouseUp events
+    - Extremely conservative to prevent any drag bugs
+    """
+    if not events:
         return events
     
-    enhanced = []
+    events_copy = deepcopy(events)
     
-    for i in range(len(events)):
-        current_event = events[i]
-        enhanced.append(deepcopy(current_event))
+    # First pass: Find ALL click events and their timestamps
+    click_times = []
+    for i, e in enumerate(events_copy):
+        event_type = e.get('Type', '')
+        if any(t in event_type for t in ['Click', 'LeftClick', 'RightClick', 'MouseDown', 'MouseUp', 'LeftDown', 'LeftUp', 'RightDown', 'RightUp']):
+            click_times.append(int(e.get('Time', 0)))
+    
+    if not click_times:
+        # No clicks at all - safe to add paths anywhere
+        return events_copy
+    
+    SAFE_DISTANCE_MS = 120000  # 2 minutes = 120,000ms
+    
+    insertions = []
+    last_x, last_y = None, None
+    
+    for idx, e in enumerate(events_copy):
+        event_type = e.get('Type', '')
+        current_time = int(e.get('Time', 0))
         
-        if i < len(events) - 1:
-            current_time = int(current_event.get('Time', 0))
-            next_time = int(events[i + 1].get('Time', 0))
-            gap_ms = next_time - current_time
-            
-            if gap_ms >= 3000 and rng.random() < 0.25:
-                camera_start = current_time + rng.randint(500, 1500)
-                direction = rng.choice(['Up', 'Down', 'Left', 'Right'])
-                hold_duration = rng.randint(200, 800)
-                
-                enhanced.append({'Time': camera_start, 'Type': 'KeyDown', 'Key': direction})
-                enhanced.append({'Time': camera_start + hold_duration, 'Type': 'KeyUp', 'Key': direction})
-                
-                opposite = {'Up': 'Down', 'Down': 'Up', 'Left': 'Right', 'Right': 'Left'}
-                return_start = camera_start + hold_duration + rng.randint(300, 800)
-                
-                if return_start + hold_duration < next_time - 500:
-                    enhanced.append({'Time': return_start, 'Type': 'KeyDown', 'Key': opposite[direction]})
-                    enhanced.append({'Time': return_start + hold_duration, 'Type': 'KeyUp', 'Key': opposite[direction]})
-                    debug_log(f"Added camera movement: {direction} during {gap_ms}ms pause")
-    
-    return enhanced
-
-def add_misclick_simulation(events, rng, target_zones=None, excluded_zones=None):
-    """NEW: Adds occasional right-click misclicks (3% chance)."""
-    if target_zones is None:
-        target_zones = []
-    if excluded_zones is None:
-        excluded_zones = []
-    
-    enhanced = []
-    
-    for i, e in enumerate(events):
-        is_click = e.get('Type') in ['Click', 'LeftClick', 'RightClick'] or 'button' in e or 'Button' in e
+        is_mouse_move = event_type == 'MouseMove'
         
-        if is_click and not is_protected_event(e) and rng.random() < 0.03:
-            if 'X' in e and 'Y' in e and e['X'] is not None and e['Y'] is not None:
-                try:
-                    target_x, target_y = int(e['X']), int(e['Y'])
-                    in_excluded = any(is_click_in_zone(target_x, target_y, zone) for zone in excluded_zones)
-                    in_target = any(is_click_in_zone(target_x, target_y, zone) for zone in target_zones) or not target_zones
-                    
-                    if in_target and not in_excluded:
-                        offset_x = rng.randint(-25, 25)
-                        offset_y = rng.randint(-25, 25)
-                        misclick_x = target_x + offset_x
-                        misclick_y = target_y + offset_y
-                        misclick_time = int(e.get('Time', 0)) - rng.randint(100, 250)
-                        
-                        enhanced.append({'Time': max(0, misclick_time), 'Type': 'RightClick', 'X': misclick_x, 'Y': misclick_y})
-                        debug_log(f"Added misclick at ({misclick_x}, {misclick_y})")
-                        
-                        corrected_event = deepcopy(e)
-                        corrected_event['Time'] = int(e.get('Time', 0)) + rng.randint(50, 150)
-                        enhanced.append(corrected_event)
-                        continue
-                except Exception as ex:
-                    debug_log(f"Misclick error: {ex}")
-        
-        enhanced.append(deepcopy(e))
-    
-    return enhanced
-
-def add_desktop_mouse_paths(events, rng):
-    """Adds mouse movement BEFORE clicks only."""
-    enhanced, last_x, last_y = [], None, None
-    
-    for e in deepcopy(events):
-        is_click = e.get('Type') in ['Click', 'LeftClick', 'RightClick']
-        is_drag = e.get('Type') in ['Drag', 'DragStart', 'DragEnd', 'MouseDrag']
-        is_mouse_move = e.get('Type') == 'MouseMove'
-        
-        if is_click and not is_drag and 'X' in e and 'Y' in e and e['X'] is not None and e['Y'] is not None:
+        # Only process MouseMove events
+        if is_mouse_move and 'X' in e and 'Y' in e:
             try:
-                target_x, target_y, click_time = int(e['X']), int(e['Y']), int(e.get('Time', 0))
+                target_x, target_y = int(e['X']), int(e['Y'])
                 
                 if last_x is not None and last_y is not None:
                     distance = ((target_x - last_x)**2 + (target_y - last_y)**2)**0.5
+                    
                     if distance > 30:
-                        num_points = rng.randint(3, 5)
-                        movement_duration = int(100 + distance * 0.25)
-                        movement_duration = min(movement_duration, 400)
+                        # CRITICAL CHECK: Is this MouseMove in a safe zone?
+                        # Must be 2+ minutes away from ANY click
+                        min_distance_to_click = min(abs(current_time - ct) for ct in click_times)
                         
-                        for i in range(1, num_points + 1):
-                            t = i / (num_points + 1)
-                            t_smooth = t * t * (3 - 2 * t)
-                            inter_x = int(last_x + (target_x - last_x) * t_smooth + rng.randint(-3, 3))
-                            inter_y = int(last_y + (target_y - last_y) * t_smooth + rng.randint(-3, 3))
-                            point_time = click_time - movement_duration + int(movement_duration * t_smooth)
+                        if min_distance_to_click >= SAFE_DISTANCE_MS:
+                            # Safe zone detected - add path
+                            prev_time = int(events_copy[idx - 1].get('Time', 0)) if idx > 0 else 0
+                            available_time = current_time - prev_time
                             
-                            if point_time < click_time:
-                                enhanced.append({'Time': max(0, point_time), 'Type': 'MouseMove', 'X': inter_x, 'Y': inter_y})
+                            num_points = rng.randint(2, 3)  # Fewer points for safety
+                            movement_duration = int(100 + distance * 0.2)
+                            movement_duration = min(movement_duration, 300)
+                            
+                            if available_time > movement_duration + 50:
+                                movement_start = current_time - movement_duration
+                                
+                                for i in range(1, num_points + 1):
+                                    t = i / (num_points + 1)
+                                    t_smooth = t * t * (3 - 2 * t)
+                                    
+                                    inter_x = int(last_x + (target_x - last_x) * t_smooth + rng.randint(-2, 2))
+                                    inter_y = int(last_y + (target_y - last_y) * t_smooth + rng.randint(-2, 2))
+                                    
+                                    point_time = movement_start + int(movement_duration * t_smooth)
+                                    point_time = max(prev_time + 1, min(point_time, current_time - 1))
+                                    
+                                    new_event = {
+                                        'Time': point_time,
+                                        'Type': 'MouseMove',
+                                        'X': inter_x,
+                                        'Y': inter_y
+                                    }
+                                    
+                                    insertions.append((idx, new_event))
                 
                 last_x, last_y = target_x, target_y
             except Exception as ex:
                 print(f"Warning: Mouse path error: {ex}", file=sys.stderr)
-        
-        enhanced.append(e)
-        
-        if is_mouse_move and 'X' in e and 'Y' in e:
-            try:
-                last_x, last_y = int(e['X']), int(e['Y'])
-            except:
-                pass
-        elif is_drag and 'X' in e and 'Y' in e:
-            try:
-                last_x, last_y = int(e['X']), int(e['Y'])
-            except:
-                pass
     
-    return enhanced
+    # Insert in REVERSE order so indices don't shift
+    for insert_idx, new_event in reversed(insertions):
+        events_copy.insert(insert_idx, new_event)
+    
+    return events_copy
 
-def add_micro_pauses(events, rng, micropause_chance=0.15):
+def add_click_grace_periods(events, rng):
+    """
+    CRITICAL FIX v2: More aggressive grace period that also accounts for MouseDown/Up pairs.
+    
+    THE PROBLEM: Click->Move before MouseUp = drag
+    
+    THE FIX: Track when we're in a button press state and delay ALL MouseMove until after release.
+    """
+    if not events:
+        return events
+    
     result = []
+    grace_period_ends_at = 0
+    button_pressed = False  # Track if mouse button is currently held
+    
     for i, e in enumerate(events):
         new_e = deepcopy(e)
+        event_type = e.get('Type', '')
+        current_time = int(e.get('Time', 0))
         
-        if is_protected_event(e):
+        is_button_down = any(t in event_type for t in ['MouseDown', 'LeftDown', 'RightDown'])
+        is_button_up = any(t in event_type for t in ['MouseUp', 'LeftUp', 'RightUp'])
+        is_simple_click = event_type in ['Click', 'LeftClick', 'RightClick']
+        is_mouse_move = event_type == 'MouseMove'
+        
+        # Track button state
+        if is_button_down:
+            button_pressed = True
+            grace_period_ms = rng.randint(500, 1000)
+            grace_period_ends_at = current_time + grace_period_ms
+            new_e['Time'] = current_time
             result.append(new_e)
-            continue
         
-        is_click = e.get('Type') in ['Click', 'LeftClick', 'RightClick'] or 'button' in e or 'Button' in e
+        elif is_button_up:
+            button_pressed = False
+            # Extend grace period AFTER button release
+            grace_period_ms = rng.randint(500, 1000)
+            grace_period_ends_at = current_time + grace_period_ms
+            new_e['Time'] = current_time
+            result.append(new_e)
         
-        if not is_click and rng.random() < micropause_chance:
-            new_e['Time'] = int(e.get('Time', 0)) + rng.randint(50, 250)
+        elif is_simple_click:
+            # Simple clicks also need grace period
+            grace_period_ms = rng.randint(500, 1000)
+            grace_period_ends_at = current_time + grace_period_ms
+            new_e['Time'] = current_time
+            result.append(new_e)
+        
+        # CRITICAL: Delay MouseMove if button is pressed OR in grace period
+        elif is_mouse_move and (button_pressed or current_time < grace_period_ends_at):
+            new_e['Time'] = max(current_time, grace_period_ends_at)
+            result.append(new_e)
+        
+        # All other events pass through
         else:
-            new_e['Time'] = int(e.get('Time', 0))
-        
-        result.append(new_e)
+            new_e['Time'] = current_time
+            result.append(new_e)
     
     return result
 
+def add_micro_pauses(events, rng, micropause_chance=0.15):
+    """
+    PERMANENTLY DISABLED - This function causes the drag bug.
+    
+    Issue: Modifying Time values of MouseMove events causes them to appear
+    between MouseDown/MouseUp pairs after re-sorting, turning clicks into drags.
+    
+    TODO: Rewrite this function to work without breaking click sequences.
+    """
+    return deepcopy(events)
+
 def add_reaction_variance(events, rng):
+    """RE-ENABLED: Add human-like delays. NEVER modify click timing."""
     varied = []
     prev_event_time = 0
     
@@ -357,14 +370,20 @@ def add_reaction_variance(events, rng):
             varied.append(new_e)
             continue
         
-        is_click = e.get('Type') in ['Click', 'RightClick'] or 'button' in e or 'Button' in e
+        event_type = e.get('Type', '')
+        is_click_event = any(t in event_type for t in ['Click', 'MouseDown', 'MouseUp', 'LeftDown', 'LeftUp', 'RightDown', 'RightUp'])
         
-        if is_click and i > 0 and rng.random() < 0.3:
-            current_time = int(e.get('Time', 0))
-            gap_since_last = current_time - prev_event_time
-            
-            if gap_since_last >= 500:
-                new_e['Time'] = current_time + rng.randint(200, 600)
+        if is_click_event:
+            new_e['Time'] = int(e.get('Time', 0))
+            prev_event_time = int(new_e.get('Time', 0))
+            varied.append(new_e)
+            continue
+        
+        current_time = int(e.get('Time', 0))
+        gap_since_last = current_time - prev_event_time
+        
+        if i > 0 and rng.random() < 0.3 and gap_since_last >= 500:
+            new_e['Time'] = current_time + rng.randint(200, 600)
         
         prev_event_time = int(new_e.get('Time', 0))
         varied.append(new_e)
@@ -372,7 +391,7 @@ def add_reaction_variance(events, rng):
     return varied
 
 def add_mouse_jitter(events, rng, is_desktop=False, target_zones=None, excluded_zones=None):
-    """Only modifies X/Y coordinates, never timing."""
+    """RE-ENABLED: Only modifies X/Y coordinates, never timing."""
     if target_zones is None:
         target_zones = []
     if excluded_zones is None:
@@ -392,6 +411,7 @@ def add_mouse_jitter(events, rng, is_desktop=False, target_zones=None, excluded_
         if is_click and 'X' in e and 'Y' in e and e['X'] is not None and e['Y'] is not None:
             try:
                 original_x, original_y = int(e['X']), int(e['Y'])
+                
                 in_excluded = any(is_click_in_zone(original_x, original_y, zone) for zone in excluded_zones)
                 
                 if not in_excluded and (any(is_click_in_zone(original_x, original_y, zone) for zone in target_zones) or not target_zones):
@@ -407,6 +427,7 @@ def add_mouse_jitter(events, rng, is_desktop=False, target_zones=None, excluded_
     return jittered
 
 def add_time_of_day_fatigue(events, rng, is_exempted=False, max_pause_ms=0):
+    """RE-ENABLED: Fatigue system."""
     if not events:
         return events, 0.0
     
@@ -436,6 +457,7 @@ def add_time_of_day_fatigue(events, rng, is_exempted=False, max_pause_ms=0):
     safe_locations = []
     for gap_idx in range(n - 1):
         event_time = int(evs[gap_idx].get('Time', 0))
+        
         is_safe = True
         for click_idx, click_time in click_times:
             if click_idx <= gap_idx and (event_time - click_time) < 1000:
@@ -485,6 +507,7 @@ def insert_intra_pauses(events, rng, is_exempted=False, max_pause_s=33, max_num_
     safe_locations = []
     for gap_idx in range(n - 1):
         event_time = int(evs[gap_idx].get('Time', 0))
+        
         is_safe = True
         for click_idx, click_time in click_times:
             if click_idx <= gap_idx and (event_time - click_time) < 1000:
@@ -542,30 +565,39 @@ class NonRepeatingSelector:
     def __init__(self, rng):
         self.rng = rng
         self.used_combos = set()
-        self.special_files_used = set()
+        self.used_files = set()
     
-    def select_files(self, files, exclude_count):
-        if not files:
-            return [], []
+    def select_unique_files(self, files, target_minutes, max_files):
+        """Select files without repeating until all files have been used."""
+        if not files or max_files <= 0:
+            return []
         
-        n = len(files)
-        file_indices = list(range(n))
-        max_exclude = min(exclude_count, max(0, n - 1))
+        file_durations = {}
+        for f in files:
+            try:
+                evs = load_json_events(Path(f))
+                _, base_dur = zero_base_events(evs)
+                file_durations[f] = int(base_dur * 1.3 / 60000)
+            except:
+                file_durations[f] = 5
         
-        all_possible = [frozenset(combo) for exclude_k in range(0, max_exclude + 1) for combo in combinations(file_indices, exclude_k)]
-        available = [c for c in all_possible if c not in self.used_combos]
+        available = [f for f in files if f not in self.used_files]
         
         if not available:
-            self.used_combos.clear()
-            available = all_possible
+            self.used_files.clear()
+            available = files.copy()
         
-        chosen_exclude_indices = self.rng.choice(available)
-        self.used_combos.add(chosen_exclude_indices)
+        selected = []
+        total_minutes = 0
         
-        excluded = [files[i] for i in chosen_exclude_indices]
-        included = [files[i] for i in file_indices if i not in chosen_exclude_indices]
+        while len(selected) < max_files and available and total_minutes < target_minutes:
+            chosen = self.rng.choice(available)
+            selected.append(chosen)
+            total_minutes += file_durations.get(chosen, 5)
+            available.remove(chosen)
+            self.used_files.add(chosen)
         
-        return included if included else files.copy(), excluded
+        return selected
     
     def shuffle_with_memory(self, items):
         if not items or len(items) <= 1:
@@ -586,12 +618,6 @@ class NonRepeatingSelector:
         chosen = self.rng.choice(available)
         self.used_combos.add(chosen)
         return list(chosen)
-    
-    def mark_special_used(self, fname):
-        self.special_files_used.add(fname)
-    
-    def is_special_used(self, fname):
-        return fname in self.special_files_used
 
 def locate_special_file(folder: Path, input_root: Path):
     for cand in [folder / SPECIAL_FILENAME, input_root / SPECIAL_FILENAME]:
@@ -605,48 +631,50 @@ def locate_special_file(folder: Path, input_root: Path):
     
     return None
 
-def generate_version_for_folder(files, rng, version_num, exclude_count, within_max_s, within_max_pauses, between_max_s, folder_path: Path, input_root: Path, selector, exemption_config: dict = None):
+def copy_always_files_unmodified(files, out_folder_for_group: Path):
+    """
+    Copy 'always first', 'always last', '-always first', '-always last' files 
+    to the same folder as merged files, unmodified.
+    Returns list of copied file paths.
+    """
+    always_files = [f for f in files if Path(f).name.lower().startswith(("always first", "always last", "-always first", "-always last"))]
+    
+    if not always_files:
+        return []
+    
+    copied_paths = []
+    for fpath in always_files:
+        fpath_obj = Path(fpath)
+        dest_path = out_folder_for_group / fpath_obj.name
+        
+        try:
+            shutil.copy2(fpath_obj, dest_path)
+            copied_paths.append(dest_path)
+            print(f"  ✓ Copied unmodified: {fpath_obj.name}")
+        except Exception as e:
+            print(f"  ✗ ERROR copying {fpath_obj.name}: {e}", file=sys.stderr)
+    
+    return copied_paths
+
+def generate_version_for_folder(files, rng, version_num, exclude_count, within_max_s, within_max_pauses, between_max_s, folder_path: Path, input_root: Path, selector, exemption_config: dict = None, target_minutes=25, max_files_per_version=4):
+    """Generate a merged version with smart file selection and FIXED mouse path timing."""
     if not files:
         return None, [], [], {"inter_file_pauses": [], "intra_file_pauses": []}, [], 0
     
-    always_first_file = next((f for f in files if Path(f).name.lower().startswith("always first")), None)
-    always_last_file = next((f for f in files if Path(f).name.lower().startswith("always last")), None)
+    # Exclude files starting with "always first", "always last", "-always first", "-always last"
+    always_first_file = next((f for f in files if Path(f).name.lower().startswith(("always first", "-always first"))), None)
+    always_last_file = next((f for f in files if Path(f).name.lower().startswith(("always last", "-always last"))), None)
     regular_files = [f for f in files if f not in [always_first_file, always_last_file]]
     
     if not regular_files:
         return None, [], [], {"inter_file_pauses": [], "intra_file_pauses": []}, [], 0
     
-    included, excluded = selector.select_files(regular_files, exclude_count)
+    selected_files = selector.select_unique_files(regular_files, target_minutes, max_files_per_version)
     
-    if not included:
-        included = regular_files.copy()
+    if not selected_files:
+        return None, [], [], {"inter_file_pauses": [], "intra_file_pauses": []}, [], 0
     
-    use_special_file = None
-    always_first_exists = always_first_file is not None
-    always_last_exists = always_last_file is not None
-    
-    if always_first_exists and always_last_exists:
-        if version_num == 1 and not selector.is_special_used(str(always_first_file)):
-            use_special_file = always_first_file
-            selector.mark_special_used(str(always_first_file))
-        elif version_num == 2 and not selector.is_special_used(str(always_last_file)):
-            use_special_file = always_last_file
-            selector.mark_special_used(str(always_last_file))
-    elif always_first_exists and not always_last_exists:
-        if version_num == 1 and not selector.is_special_used(str(always_first_file)):
-            use_special_file = always_first_file
-            selector.mark_special_used(str(always_first_file))
-    elif always_last_exists and not always_first_exists:
-        if version_num == 1 and not selector.is_special_used(str(always_last_file)):
-            use_special_file = always_last_file
-            selector.mark_special_used(str(always_last_file))
-    
-    final_files = selector.shuffle_with_memory(included)
-    
-    if use_special_file == always_first_file:
-        final_files.insert(0, always_first_file)
-    elif use_special_file == always_last_file:
-        final_files.append(always_last_file)
+    final_files = selector.shuffle_with_memory(selected_files)
     
     special_path = locate_special_file(folder_path, input_root)
     is_mobile_group = any("mobile" in part.lower() for part in folder_path.parts)
@@ -683,38 +711,20 @@ def generate_version_for_folder(files, rng, version_num, exclude_count, within_m
             exemption_config = exemption_config or {"exempted_folders": set(), "disable_intra_pauses": False, "disable_afk": False}
             is_exempted = exemption_config["exempted_folders"] and is_folder_exempted(folder_path, exemption_config["exempted_folders"])
             
-            # CRITICAL: Preserve click integrity FIRST
             zb_evs = preserve_click_integrity(zb_evs)
             
             if not is_desktop:
-                # Mobile: No mouse paths, just timing variations
-                zb_evs = add_micro_pauses(zb_evs, rng)
-                zb_evs = add_reaction_variance(zb_evs, rng)
                 zb_evs = add_mouse_jitter(zb_evs, rng, is_desktop=False, target_zones=target_zones, excluded_zones=excluded_zones)
-                
-                zb_evs, _ = zero_base_events(zb_evs)
-                
-                # NEW: Add misclicks
-                zb_evs = add_misclick_simulation(zb_evs, rng, target_zones=target_zones, excluded_zones=excluded_zones)
-                zb_evs, _ = zero_base_events(zb_evs)
-                
-                zb_evs, _ = add_time_of_day_fatigue(zb_evs, rng, is_exempted=is_exempted, max_pause_ms=0)
-                
-            else:
-                # Desktop: Add mouse paths FIRST
-                zb_evs = add_desktop_mouse_paths(zb_evs, rng)
-                zb_evs, _ = zero_base_events(zb_evs)
-                
+                zb_evs = add_click_grace_periods(zb_evs, rng)
                 zb_evs = add_micro_pauses(zb_evs, rng)
                 zb_evs = add_reaction_variance(zb_evs, rng)
+                zb_evs, _ = add_time_of_day_fatigue(zb_evs, rng, is_exempted=is_exempted, max_pause_ms=0)
+            else:
                 zb_evs = add_mouse_jitter(zb_evs, rng, is_desktop=True, target_zones=target_zones, excluded_zones=excluded_zones)
-                
-                zb_evs, _ = zero_base_events(zb_evs)
-                
-                # NEW: Add misclicks
-                zb_evs = add_misclick_simulation(zb_evs, rng, target_zones=target_zones, excluded_zones=excluded_zones)
-                zb_evs, _ = zero_base_events(zb_evs)
-                
+                zb_evs = add_desktop_mouse_paths(zb_evs, rng)
+                zb_evs = add_click_grace_periods(zb_evs, rng)
+                zb_evs = add_micro_pauses(zb_evs, rng)
+                zb_evs = add_reaction_variance(zb_evs, rng)
                 zb_evs, _ = add_time_of_day_fatigue(zb_evs, rng, is_exempted=is_exempted, max_pause_ms=0)
             
             zb_evs, file_duration_ms = zero_base_events(zb_evs)
@@ -731,11 +741,6 @@ def generate_version_for_folder(files, rng, version_num, exclude_count, within_m
                 intra_evs = zb_evs
                 if rng.random() < 0.5:
                     intra_evs = add_afk_pause(intra_evs, rng)
-            
-            # NEW: Add camera movements during long pauses (desktop only)
-            if is_desktop:
-                intra_evs = add_camera_movements_in_pauses(intra_evs, rng, is_desktop=True)
-                intra_evs, _ = zero_base_events(intra_evs)
         else:
             intra_evs = zb_evs
         
@@ -765,18 +770,29 @@ def generate_version_for_folder(files, rng, version_num, exclude_count, within_m
     total_ms = time_cursor if merged else 0
     total_minutes = compute_minutes_from_ms(total_ms)
     
+    parts = []
+    for f in final_files:
+        if f is None:
+            continue
+        
+        part_name = part_from_filename(f)
+        minutes = compute_minutes_from_ms(per_file_event_ms.get(str(f), 0) + per_file_inter_ms.get(str(f), 0))
+        parts.append(f"{part_name}[{minutes}m]")
+    
     letters = number_to_letters(version_num or 1)
-    tag = ""
     
-    if use_special_file == always_first_file and always_first_file is not None:
-        tag = "FIRST"
-    elif use_special_file == always_last_file and always_last_file is not None:
-        tag = "LAST"
+    parts_str = ' - '.join(parts)
+    base_name = f"{letters}_{total_minutes}m= {parts_str}"
     
-    # FIXED: Much shorter filename to avoid "File name too long" errors
-    tag_prefix = f"{tag}-" if tag else ""
-    file_count = len(final_files)
-    safe_name = f"{tag_prefix}{letters}_{total_minutes}m_{file_count}files"
+    MAX_FILENAME_LENGTH = 200
+    
+    if len(base_name) > MAX_FILENAME_LENGTH:
+        file_count = len(final_files)
+        base_name = f"{letters}_{total_minutes}m_{file_count}files"
+    
+    safe_name = ''.join(ch for ch in base_name if ch not in '/\\:*?"<>|')
+    
+    excluded = [f for f in regular_files if f not in selected_files]
     
     return f"{safe_name}.json", merged, [str(p) for p in final_files], pause_info, [str(p) for p in excluded], total_minutes
 
@@ -790,6 +806,8 @@ def main():
     parser.add_argument("--within-max-time", default="33")
     parser.add_argument("--within-max-pauses", type=int, default=2)
     parser.add_argument("--between-max-time", default="18")
+    parser.add_argument("--target-minutes", type=int, default=25, help="Target duration per merged file in minutes")
+    parser.add_argument("--max-files", type=int, default=4, help="Maximum files to merge per version")
     
     args = parser.parse_args()
     
@@ -836,10 +854,16 @@ def main():
         
         selector = NonRepeatingSelector(rng)
         
+        print(f"Processing folder: {rel_folder} ({len(files)} files available)")
+        
+        always_copied = copy_always_files_unmodified(files, out_folder_for_group)
+        all_written_paths.extend(always_copied)
+        
         for v in range(1, max(1, args.versions) + 1):
             merged_fname, merged_events, finals, pauses, excluded, total_minutes = generate_version_for_folder(
                 files, rng, v, args.exclude_count, within_max_s, args.within_max_pauses, 
-                between_max_s, folder, input_root, selector, exemption_config
+                between_max_s, folder, input_root, selector, exemption_config, 
+                target_minutes=args.target_minutes, max_files_per_version=args.max_files
             )
             
             if not merged_fname:
@@ -849,10 +873,10 @@ def main():
             
             try:
                 out_path.write_text(json.dumps(merged_events, indent=2, ensure_ascii=False), encoding="utf-8")
-                print(f"WROTE: {out_path}")
+                print(f"  ✓ Version {v}: {merged_fname}")
                 all_written_paths.append(out_path)
             except Exception as e:
-                print(f"ERROR writing {out_path}: {e}", file=sys.stderr)
+                print(f"  ✗ ERROR writing {out_path}: {e}", file=sys.stderr)
     
     zip_path = output_parent / f"{output_base_name}.zip"
     with ZipFile(zip_path, "w") as zf:
@@ -863,7 +887,7 @@ def main():
                 arcname = f"{output_base_name}/{fpath.name}"
             zf.write(fpath, arcname=arcname)
     
-    print(f"DONE. Created: {zip_path}")
+    print(f"\n✅ DONE. Created: {zip_path} ({len(all_written_paths)} files)")
 
 if __name__ == "__main__":
     main()
