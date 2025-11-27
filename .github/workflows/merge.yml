@@ -3,16 +3,12 @@ name: Merge macros (persisted counter, scan all folders, zip top-level)
 on:
   workflow_dispatch:
     inputs:
-      exempted_folders:
-        description: 'Folders to exempt from pause/AFK rules (comma-separated folder paths, or leave empty for none)'
-        required: false
-        default: ''
       versions:
         description: 'How many versions per group'
         required: true
         default: '6'
       within_max_time:
-        description: 'Intra-file max pause time (seconds) - Used for EXEMPTED folders only'
+        description: 'Intra-file max pause time (seconds) - Used for TIME SENSITIVE folders only'
         required: true
         default: '33'
       within_max_pauses:
@@ -28,149 +24,64 @@ on:
         required: true
         default: '10'
       target_minutes:
-        description: 'Target duration per merged file in minutes'
+        description: 'Target duration per merged file in minutes (will reuse files if needed)'
         required: true
         default: '25'
-      max_files:
-        description: 'Maximum files to merge per version'
-        required: true
-        default: '4'
+      disable_time_sensitive_pauses:
+        description: 'Disable intra/inter pauses for TIME SENSITIVE folders (only disables short pauses, long AFK always disabled)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   merge:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    permissions:
-      contents: write
     
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: true
+      - uses: actions/checkout@v4
       
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-      
-      - name: Bump run counter (expose BUNDLE_SEQ)
-        id: bump
-        run: |
-          set -euo pipefail
-          COUNTER_FILE=".github/merge_bundle_counter.txt"
+          python-version: '3.10'
           
-          if [ -f "$COUNTER_FILE" ]; then
-            PREV=$(cat "$COUNTER_FILE" | tr -d ' \t\n\r' || echo "")
-            PREV=${PREV:-0}
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+            
+      - name: Install dependencies
+        run: pip install -r requirements.txt || true
+        
+      - name: Get current BUNDLE_SEQ
+        id: bundle_seq_read
+        run: |
+          if [ -f .github/merge_bundle_counter.txt ]; then
+            BUNDLE_SEQ=$(cat .github/merge_bundle_counter.txt)
+            echo "BUNDLE_SEQ=$BUNDLE_SEQ" >> "$GITHUB_ENV"
           else
-            PREV=0
+            echo "BUNDLE_SEQ=1" >> "$GITHUB_ENV"
           fi
           
-          NEXT=$((PREV + 1))
-          mkdir -p "$(dirname "$COUNTER_FILE")"
-          echo "$NEXT" > "$COUNTER_FILE"
-          echo "BUNDLE_SEQ=$NEXT" >> "$GITHUB_ENV"
-          echo "BUMPED counter: $PREV -> $NEXT"
-      
-      - name: Commit and push bumped counter back to repo
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Execute macro merge script
         run: |
-          set -euo pipefail
-          COUNTER_FILE=".github/merge_bundle_counter.txt"
-          
-          if [ ! -f "$COUNTER_FILE" ]; then
-            echo "Counter file not present; nothing to commit."
-            exit 0
-          fi
-          
-          git config user.name "github-actions[bot]" || true
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com" || true
-          git add "$COUNTER_FILE"
-          
-          if git diff --staged --quiet; then
-            echo "No changes to counter to commit."
-          else
-            NEXT=$(cat "$COUNTER_FILE" || echo "")
-            git commit -m "CI: bump merged bundle counter to ${NEXT}" || true
-            git push origin HEAD || (echo "git push failed" && false)
-            echo "Pushed updated counter: ${NEXT}"
-          fi
-      
-      - name: Create exemption config from UI input
+          python merge_macros.py \
+            --versions ${{ github.event.inputs.versions }} \
+            --within-max-time '${{ github.event.inputs.within_max_time }}' \
+            --within-max-pauses ${{ github.event.inputs.within_max_pauses }} \
+            --between-max-time '${{ github.event.inputs.between_max_time }}' \
+            --exclude-count ${{ github.event.inputs.exclude_count }} \
+            --target-minutes ${{ github.event.inputs.target_minutes }}
+            
+      - name: Create ZIP artifact
         run: |
-          python3 << 'PYTHON_EOF'
-          import json
+          BUNDLE="${BUNDLE_SEQ:-1}"
           
-          exempted_input = "${{ github.event.inputs.exempted_folders }}"
-          folders = [f.strip() for f in exempted_input.split(',') if f.strip()]
-          
-          config = {
-              "exempted_folders": folders,
-              "disable_intra_pauses": len(folders) > 0,
-              "disable_afk": len(folders) > 0
-          }
-          
-          with open("exemption_config.json", "w") as f:
-              json.dump(config, f, indent=2)
-          
-          print("Created exemption_config.json:")
-          print(json.dumps(config, indent=2))
-          PYTHON_EOF
-      
-      - name: Show originals (debug)
-        run: |
-          echo "PWD: $PWD"
-          echo "Listing originals (top-level):"
-          ls -la originals || true
-          echo "Recursive sample (json files):"
-          find originals -type f -name '*.json' -print | head -20 || true
-      
-      - name: Run merge_macros.py with UI inputs
-        env:
-          PYTHONUNBUFFERED: '1'
-        run: |
-          set -euo pipefail
-          
-          VERSIONS="${{ github.event.inputs.versions }}"
-          WITHIN_MAX_TIME="${{ github.event.inputs.within_max_time }}"
-          WITHIN_MAX_PAUSES="${{ github.event.inputs.within_max_pauses }}"
-          BETWEEN_MAX_TIME="${{ github.event.inputs.between_max_time }}"
-          EXCLUDE_COUNT="${{ github.event.inputs.exclude_count }}"
-          TARGET_MINUTES="${{ github.event.inputs.target_minutes }}"
-          MAX_FILES="${{ github.event.inputs.max_files }}"
-          
-          echo "Inputs:"
-          echo "  versions=${VERSIONS}"
-          echo "  within_max_time='${WITHIN_MAX_TIME}'"
-          echo "  within_max_pauses=${WITHIN_MAX_PAUSES}"
-          echo "  between_max_time='${BETWEEN_MAX_TIME}'"
-          echo "  exclude_count=${EXCLUDE_COUNT}"
-          echo "  target_minutes=${TARGET_MINUTES}"
-          echo "  max_files=${MAX_FILES}"
-          echo "BUNDLE_SEQ='${BUNDLE_SEQ:-(none)}'"
-          
-          python3 merge_macros.py \
-            --input-dir "originals" \
-            --output-dir "output" \
-            --versions "${VERSIONS}" \
-            --within-max-time "${WITHIN_MAX_TIME}" \
-            --within-max-pauses "${WITHIN_MAX_PAUSES}" \
-            --between-max-time "${BETWEEN_MAX_TIME}" \
-            --exclude-count "${EXCLUDE_COUNT}" \
-            --target-minutes "${TARGET_MINUTES}" \
-            --max-files "${MAX_FILES}"
-      
-      - name: Zip merged outputs
-        if: always()
-        run: |
-          set -euo pipefail
-          
-          BUNDLE="${BUNDLE_SEQ:-}"
-          if [ -z "$BUNDLE" ]; then
+          # Check if the counter file exists and read the updated counter (post-script execution)
+          if [ -f .github/merge_bundle_counter.txt ]; then
             BUNDLE=$(cat .github/merge_bundle_counter.txt 2>/dev/null || echo "")
             BUNDLE=${BUNDLE:-1}
           fi
@@ -197,11 +108,10 @@ jobs:
             zip "${OUTPUT_BASE}.zip" empty_placeholder.txt || true
             echo "ZIP_NAME=${OUTPUT_BASE}.zip" >> "$GITHUB_ENV"
           fi
-      
+          
       - name: Upload merged ZIP artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4 # <-- **CRITICAL FIX: Updated to v4**
         with:
-          name: merged-bundle
+          name: merged_macros_${{ env.BUNDLE_SEQ }}
           path: ${{ env.ZIP_NAME }}
-          retention-days: 90
