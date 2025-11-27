@@ -48,24 +48,33 @@ def write_counter_file(n: int):
 
 def load_exemption_config():
     config_file = Path.cwd() / "exemption_config.json"
+    default_config = {
+        "auto_detect_time_sensitive": True,
+        "disable_intra_pauses": False,
+        "disable_inter_pauses": False,
+        "exempted_folders": set(),
+        "disable_afk": False,
+    }
+
     if config_file.exists():
         try:
             data = json.loads(config_file.read_text(encoding="utf-8"))
-            return {
+            default_config.update({
+                "auto_detect_time_sensitive": data.get("auto_detect_time_sensitive", True),
+                "disable_intra_pauses": data.get("disable_intra_pauses", False),
+                "disable_inter_pauses": data.get("disable_inter_pauses", False),
+                "disable_afk": data.get("disable_afk", False),
                 "exempted_folders": set(data.get("exempted_folders", [])),
-                "disable_intra_pauses": data.get("disable_intra_pauses", True),
-                "disable_afk": data.get("disable_afk", True)
-            }
+            })
         except Exception as e:
             print(f"WARNING: Failed to load exemptions: {e}", file=sys.stderr)
-    return {"exempted_folders": set(), "disable_intra_pauses": False, "disable_afk": False}
 
-def is_folder_exempted(folder_path: Path, exempted_folders: set) -> bool:
-    folder_str = str(folder_path).lower().replace("\\", "/")
-    for exempted in exempted_folders:
-        if exempted.lower().replace("\\", "/") in folder_str:
-            return True
-    return False
+    return default_config
+
+def is_time_sensitive_folder(folder_path: Path) -> bool:
+    """Check if folder name contains 'time sensitive' (case insensitive)"""
+    folder_str = str(folder_path).lower()
+    return "time sensitive" in folder_str
 
 def load_click_zones(folder_path: Path):
     search_paths = [folder_path / "click_zones.json", folder_path.parent / "click_zones.json", Path.cwd() / "click_zones.json"]
@@ -198,12 +207,6 @@ def part_from_filename(path: str) -> str:
 def add_desktop_mouse_paths(events, rng):
     """
     ULTRA-SAFE VERSION: Only adds mouse paths in long click-free periods.
-    
-    NEW RULES:
-    - Only operates in periods with NO clicks for 2+ minutes (120,000ms)
-    - Must have 2 minutes before AND 2 minutes after the path insertion point
-    - Never inserts near any MouseDown/MouseUp events
-    - Extremely conservative to prevent any drag bugs
     """
     if not events:
         return events
@@ -289,10 +292,6 @@ def add_desktop_mouse_paths(events, rng):
 def add_click_grace_periods(events, rng):
     """
     CRITICAL FIX v2: More aggressive grace period that also accounts for MouseDown/Up pairs.
-    
-    THE PROBLEM: Click->Move before MouseUp = drag
-    
-    THE FIX: Track when we're in a button press state and delay ALL MouseMove until after release.
     """
     if not events:
         return events
@@ -349,11 +348,6 @@ def add_click_grace_periods(events, rng):
 def add_micro_pauses(events, rng, micropause_chance=0.15):
     """
     PERMANENTLY DISABLED - This function causes the drag bug.
-    
-    Issue: Modifying Time values of MouseMove events causes them to appear
-    between MouseDown/MouseUp pairs after re-sorting, turning clicks into drags.
-    
-    TODO: Rewrite this function to work without breaking click sequences.
     """
     return deepcopy(events)
 
@@ -429,7 +423,7 @@ def add_mouse_jitter(events, rng, is_desktop=False, target_zones=None, excluded_
 def add_time_of_day_fatigue(events, rng, is_exempted=False, max_pause_ms=0):
     """RE-ENABLED: Fatigue system."""
     if not events:
-        return events, 0.0
+        return deepcopy(events), 0.0
     
     if is_exempted:
         return deepcopy(events), 0.0
@@ -480,6 +474,10 @@ def add_time_of_day_fatigue(events, rng, is_exempted=False, max_pause_ms=0):
     
     return evs, 0.0
 
+def is_folder_exempted(folder_path: Path, exempted_folders: set) -> bool:
+    """Helper function to check if a folder is in the exempted set."""
+    return str(folder_path.name).lower() in {f.lower() for f in exempted_folders}
+
 def insert_intra_pauses(events, rng, is_exempted=False, max_pause_s=33, max_num_pauses=3):
     if not events:
         return deepcopy(events), []
@@ -487,10 +485,7 @@ def insert_intra_pauses(events, rng, is_exempted=False, max_pause_s=33, max_num_
     evs = deepcopy(events)
     n = len(evs)
     
-    if n < 2:
-        return evs, []
-    
-    if not is_exempted:
+    if n < 2 or not is_exempted:
         return evs, []
     
     num_pauses = rng.randint(0, max_num_pauses)
@@ -567,33 +562,36 @@ class NonRepeatingSelector:
         self.used_combos = set()
         self.used_files = set()
     
-    def select_unique_files(self, files, target_minutes, max_files):
-        """Select files without repeating until all files have been used."""
-        if not files or max_files <= 0:
+    def select_unique_files(self, files, target_minutes):
+        """Select files until target_minutes duration is reached."""
+        if not files or target_minutes <= 0:
             return []
         
         file_durations = {}
         for f in files:
             try:
                 evs = load_json_events(Path(f))
+                # Estimate file duration slightly generously
                 _, base_dur = zero_base_events(evs)
-                file_durations[f] = int(base_dur * 1.3 / 60000)
+                # Durations are in minutes
+                file_durations[f] = int(base_dur * 1.3 / 60000) or 1 
             except:
-                file_durations[f] = 5
+                file_durations[f] = 1
         
         available = [f for f in files if f not in self.used_files]
         
         if not available:
+            # Loop through files again if all have been used
             self.used_files.clear()
             available = files.copy()
         
         selected = []
         total_minutes = 0
         
-        while len(selected) < max_files and available and total_minutes < target_minutes:
+        while available and total_minutes < target_minutes:
             chosen = self.rng.choice(available)
             selected.append(chosen)
-            total_minutes += file_durations.get(chosen, 5)
+            total_minutes += file_durations.get(chosen, 1)
             available.remove(chosen)
             self.used_files.add(chosen)
         
@@ -650,14 +648,21 @@ def copy_always_files_unmodified(files, out_folder_for_group: Path):
         try:
             shutil.copy2(fpath_obj, dest_path)
             copied_paths.append(dest_path)
-            print(f"  ✓ Copied unmodified: {fpath_obj.name}")
         except Exception as e:
             print(f"  ✗ ERROR copying {fpath_obj.name}: {e}", file=sys.stderr)
     
     return copied_paths
 
-def generate_version_for_folder(files, rng, version_num, exclude_count, within_max_s, within_max_pauses, between_max_s, folder_path: Path, input_root: Path, selector, exemption_config: dict = None, target_minutes=25, max_files_per_version=4):
+def generate_version_for_folder(files, rng, version_num, exclude_count, within_max_s, within_max_pauses, between_max_s, folder_path: Path, input_root: Path, selector, exemption_config: dict = None, target_minutes=25):
     """Generate a merged version with smart file selection and FIXED mouse path timing."""
+    if exemption_config is None:
+        exemption_config = {
+            "auto_detect_time_sensitive": True,
+            "disable_intra_pauses": False,
+            "disable_inter_pauses": False,
+            "exempted_folders": set(),
+            "disable_afk": False,
+        }
     if not files:
         return None, [], [], {"inter_file_pauses": [], "intra_file_pauses": []}, [], 0
     
@@ -669,7 +674,7 @@ def generate_version_for_folder(files, rng, version_num, exclude_count, within_m
     if not regular_files:
         return None, [], [], {"inter_file_pauses": [], "intra_file_pauses": []}, [], 0
     
-    selected_files = selector.select_unique_files(regular_files, target_minutes, max_files_per_version)
+    selected_files = selector.select_unique_files(regular_files, target_minutes)
     
     if not selected_files:
         return None, [], [], {"inter_file_pauses": [], "intra_file_pauses": []}, [], 0
@@ -708,8 +713,7 @@ def generate_version_for_folder(files, rng, version_num, exclude_count, within_m
         if not is_special:
             is_desktop = "deskt" in str(folder_path).lower()
             
-            exemption_config = exemption_config or {"exempted_folders": set(), "disable_intra_pauses": False, "disable_afk": False}
-            is_exempted = exemption_config["exempted_folders"] and is_folder_exempted(folder_path, exemption_config["exempted_folders"])
+            is_exempted = is_folder_exempted(folder_path, exemption_config["exempted_folders"])
             
             zb_evs = preserve_click_integrity(zb_evs)
             
@@ -752,10 +756,12 @@ def generate_version_for_folder(files, rng, version_num, exclude_count, within_m
         time_cursor = shifted[-1]["Time"] if shifted else time_cursor
         
         if idx < len(final_files) - 1:
-            exemption_config = exemption_config or {"exempted_folders": set(), "disable_intra_pauses": False, "disable_afk": False}
-            is_exempted = exemption_config["exempted_folders"] and is_folder_exempted(folder_path, exemption_config["exempted_folders"])
+            is_time_sensitive = is_time_sensitive_folder(folder_path)
             
-            if is_exempted:
+            # Time sensitive: optionally skip inter-file pauses based on checkbox
+            if is_time_sensitive and exemption_config.get("disable_inter_pauses", False):
+                pause_ms = rng.randint(100, 500)  # Very short pause
+            elif is_time_sensitive:
                 pause_ms = rng.randint(0, int(between_max_s * 1000))
             else:
                 pause_ms = rng.randint(1000, 12000)
@@ -807,7 +813,6 @@ def main():
     parser.add_argument("--within-max-pauses", type=int, default=2)
     parser.add_argument("--between-max-time", default="18")
     parser.add_argument("--target-minutes", type=int, default=25, help="Target duration per merged file in minutes")
-    parser.add_argument("--max-files", type=int, default=4, help="Maximum files to merge per version")
     
     args = parser.parse_args()
     
@@ -863,7 +868,7 @@ def main():
             merged_fname, merged_events, finals, pauses, excluded, total_minutes = generate_version_for_folder(
                 files, rng, v, args.exclude_count, within_max_s, args.within_max_pauses, 
                 between_max_s, folder, input_root, selector, exemption_config, 
-                target_minutes=args.target_minutes, max_files_per_version=args.max_files
+                target_minutes=args.target_minutes
             )
             
             if not merged_fname:
